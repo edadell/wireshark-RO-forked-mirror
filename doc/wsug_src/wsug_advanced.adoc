@@ -77,6 +77,13 @@ menu:Appearance[Theme and Font].
 The stream content won’t be updated while doing a live capture. To get the
 latest content you’ll have to reopen the dialog.
 
+[NOTE]
+====
+The fundamental nature of TCP being based on sequence numbers, Wireshark has
+the ability to detect traffic discontinuities. They are indicated with such
+messages : [32 bytes missing in capture file].
+====
+
 You can choose from the following actions:
 
 btn:[Help]:: Show this help.

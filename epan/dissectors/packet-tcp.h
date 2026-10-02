@@ -387,6 +387,7 @@ typedef struct _tcp_flow_t {
 	bool is_first_ack;  /* indicates if this is the first ACK */
 	bool closing_initiator; /* tracking who is responsible of the connection end */
 	bool closing_initiator_rst; /* tracking who sent TCP RST first */
+	uint32_t last_packet; /* last packet number in this direction, to help taps ( XXX - move to tcp_analyze_seq_info ?) */
 	tcp_analyze_seq_flow_info_t* tcp_analyze_seq_info;
 
 	/* see TCP_A_* in packet-tcp.c */

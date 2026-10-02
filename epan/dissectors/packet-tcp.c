@@ -54,6 +54,9 @@ static int exported_pdu_tap;
 /* Place TCP summary in proto tree */
 static bool tcp_summary_in_tree = true;
 
+/* Keep pass number for taps (particularly Follow Stream) */
+static bool first_pass = true;
+
 #define TCP_DEFAULT_CLIENTPORT_DISSECTORS            "20"
 static range_t *tcp_clientport_dissectors_range;
 
@@ -1517,6 +1520,122 @@ typedef struct tcp_follow_tap_data
 } tcp_follow_tap_data_t;
 
 /*
+ * Tries to apply segments from fragments list tail, to the reconstructed payload.
+ * Fragments that can be appended to the end of the payload will be applied (and
+ * removed from the list).
+ * Typically a tail is seen with one direction traffic with missing data,
+ * or when the last data packets aren't acknowledged.
+ *
+ * Returns true if one fragment has been applied or false if no more fragments
+ * can be added to the payload.
+ */
+static bool
+unstack_fragments(follow_info_t *follow_info, bool is_server)
+{
+    GList *fragment_entry;
+    GList *fragment_entry_mem = NULL;
+    follow_record_t *fragment, *follow_record;
+    follow_record_t *fragment_mem = NULL;
+    uint32_t lowest_seq = 0;
+    char *dummy_str;
+
+    fragment_entry = g_list_first(follow_info->fragments[is_server]);
+    if (fragment_entry == NULL)
+        return false;
+
+    bool have_fragments = false;
+
+    for (; fragment_entry != NULL; fragment_entry = g_list_next(fragment_entry))
+    {
+        fragment = (follow_record_t*)fragment_entry->data;
+        /* First fragment in list, or packet is out of order */
+        if(!have_fragments || LT_SEQ(fragment->seq, lowest_seq)) {
+            lowest_seq = fragment->seq;
+            fragment_mem = fragment;
+            fragment_entry_mem = fragment_entry;
+
+            have_fragments = true;
+        }
+    }
+
+    if(!have_fragments) {
+        return false;
+    }
+
+    /* we still need to check if this one is monotonically increasing the sequence */
+
+    if( LT_SEQ(fragment_mem->seq, follow_info->seq[is_server]) ) {
+        uint32_t newseq = fragment_mem->seq + fragment_mem->data->len;
+        /* overlaps an old segment */
+        if( GT_SEQ(newseq, follow_info->seq[is_server]) ) {
+            uint32_t new_pos = follow_info->seq[is_server] - fragment_mem->seq;
+
+            if ( fragment_mem->data->len > new_pos ) {
+                uint32_t new_frag_size = fragment_mem->data->len - new_pos;
+
+                follow_record = g_new0(follow_record_t,1);
+
+                follow_record->is_server = is_server;
+                follow_record->packet_num = fragment_mem->packet_num;
+                follow_record->abs_ts = fragment_mem->abs_ts;
+                follow_record->seq = follow_info->seq[is_server] + new_frag_size;
+
+                follow_record->data = g_byte_array_append(g_byte_array_new(),
+                                                          fragment_mem->data->data + new_pos,
+                                                          new_frag_size);
+
+                follow_info->payload = g_list_prepend(follow_info->payload, follow_record);
+            }
+            follow_info->seq[is_server] += (fragment_mem->data->len - new_pos);
+
+        }
+        /* else : redundant with an old segment, likely a retransmission to be ignored */
+
+        g_byte_array_free(fragment_mem->data, true);
+        g_free(fragment_mem);
+        follow_info->fragments[is_server] = g_list_delete_link(follow_info->fragments[is_server], fragment_entry_mem);
+        return true;
+    }
+
+    if( EQ_SEQ(fragment_mem->seq, follow_info->seq[is_server]) ) {
+        /* this fragment fits the stream */
+        if( fragment_mem->data->len > 0 ) {
+            follow_info->payload = g_list_prepend(follow_info->payload, fragment_mem);
+        }
+
+        follow_info->seq[is_server] += fragment_mem->data->len;
+        follow_info->fragments[is_server] = g_list_delete_link(follow_info->fragments[is_server], fragment_entry_mem);
+        return true;
+    }
+    else {
+        /* insert the dummy message, then the fragment */
+        dummy_str = ws_strdup_printf("[%d bytes missing in capture file]",
+                        (int)(fragment_mem->seq - follow_info->seq[is_server]) );
+        follow_record = g_new0(follow_record_t,1);
+
+        follow_record->data = g_byte_array_append(g_byte_array_new(),
+                                                  (unsigned char*)dummy_str,
+                                                  (unsigned)strlen(dummy_str)+1);
+
+        g_free(dummy_str);
+
+        follow_record->is_server = is_server;
+        follow_record->packet_num = fragment_mem->packet_num;
+        follow_record->abs_ts = fragment_mem->abs_ts;
+        follow_record->seq = follow_info->seq[is_server];
+
+        follow_info->payload = g_list_prepend(follow_info->payload, follow_record);
+
+        follow_info->payload = g_list_prepend(follow_info->payload, fragment_mem);
+        follow_info->seq[is_server] = fragment_mem->seq + fragment_mem->data->len;
+
+        follow_info->fragments[is_server] = g_list_delete_link(follow_info->fragments[is_server], fragment_entry_mem);
+    }
+
+    return true;
+}
+
+/*
  * Tries to apply segments from fragments list to the reconstructed payload.
  * Fragments that can be appended to the end of the payload will be applied (and
  * removed from the list). Fragments that should have been received (according
@@ -1645,12 +1764,15 @@ follow_tcp_tap_listener(void *tapdata, packet_info *pinfo,
         return TAP_PACKET_DONT_REDRAW;
 
     bool is_server;
+    bool is_last_packet;
     uint32_t sequence = follow_data->tcph->th_seq;
     uint32_t length = follow_data->tcph->th_have_seglen
                         ? follow_data->tcph->th_seglen
                         : 0;
     uint32_t data_offset = 0;
     uint32_t data_length = tvb_captured_length(follow_data->tvb);
+
+    is_last_packet = ( !first_pass && pinfo->num == follow_data->tcpd->fwd->last_packet);
 
     if (follow_data->tcph->th_flags & TH_SYN) {
         sequence++;
@@ -1705,7 +1827,19 @@ follow_tcp_tap_listener(void *tapdata, packet_info *pinfo,
      * Ignore segments that have no new data (either because it was empty, or
      * because it was fully overlapping with previously received data).
      */
-    if (data_length == 0 || LT_SEQ(sequence, follow_info->seq[is_server])) {
+    if (data_length == 0) {
+        if(is_last_packet &&
+           ((g_list_length(follow_info->fragments[is_server]) != 0 &&
+             g_list_length(follow_info->fragments[!is_server]) == 0) ||
+            (g_list_length(follow_info->fragments[is_server]) == 0 &&
+             g_list_length(follow_info->fragments[!is_server]) != 0))) {
+
+            while(unstack_fragments(follow_info, is_server));
+        }
+
+        return TAP_PACKET_DONT_REDRAW;
+    }
+    else if (LT_SEQ(sequence, follow_info->seq[is_server])) {
         return TAP_PACKET_DONT_REDRAW;
     }
 
@@ -1730,6 +1864,18 @@ follow_tcp_tap_listener(void *tapdata, packet_info *pinfo,
         /* Out of order packet (more preceding segments are expected). */
         follow_info->fragments[is_server] = g_list_append(follow_info->fragments[is_server], follow_record);
     }
+
+    /* Try unstacking tail fragments, typically when the 2nd pass is coming to its end.
+     * If there are both (client, and server), it's not handled, but does that ever happen ?
+     */
+    if(is_last_packet &&
+        ((g_list_length(follow_info->fragments[is_server]) != 0 &&
+          g_list_length(follow_info->fragments[!is_server]) == 0) ||
+         (g_list_length(follow_info->fragments[is_server]) == 0 &&
+          g_list_length(follow_info->fragments[!is_server]) != 0))) {
+        while(unstack_fragments(follow_info, is_server));
+    }
+
     return TAP_PACKET_DONT_REDRAW;
 }
 
@@ -10266,6 +10412,11 @@ dissect_tcp(tvbuff_t *tvb, packet_info *pinfo, proto_tree *tree, void* data _U_)
                 tcpd->rev->scps_capable = tcpd->fwd->scps_capable = false;
             }
         }
+        /* mark it at being the last of this flow, but only after the 2nd pass */
+        tcpd->fwd->last_packet = pinfo->num;
+    }
+    else if(first_pass) {
+        first_pass = false;
     }
 
     if (((tcph->th_flags & (TH_SYN|TH_ACK))==(TH_SYN|TH_ACK)) &&
@@ -10418,6 +10569,8 @@ static void
 tcp_init(void)
 {
     tcp_stream_count = 0;
+
+    first_pass = true;
 
     /* MPTCP init */
     mptcp_stream_count = 0;
