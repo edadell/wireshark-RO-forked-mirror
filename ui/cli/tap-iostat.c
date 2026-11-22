@@ -1425,7 +1425,7 @@ register_io_tap(io_stat_t *io, unsigned int i, const char *filter, GString *err)
     io->items[i].counter    = 0;
     io->items[i].num        = 0;
 
-    io->filters[i] = filter;
+    io->filters[i] = g_strdup(filter);
     flt = filter;
 
     io->calc_type[i] = CALC_TYPE_FRAMES_AND_BYTES;
@@ -1571,6 +1571,70 @@ register_io_tap(io_stat_t *io, unsigned int i, const char *filter, GString *err)
     return true;
 }
 
+/* A basic parser where a String is tokenized over ',' (comma),
+ * except inside an expression surrounded by parentheses (),
+ * braces {}, or brackets [], where ',' is just treated
+ * as an ordinary character and not used as a legitimate separator anymore.
+ * Returns an array of tokens, or NULL if tokenizing failed.
+ */
+static GPtrArray *
+split_iostat_columns(const char *cols_str)
+{
+    GPtrArray *cols = g_ptr_array_new_with_free_func(g_free);
+    if (!cols_str || *cols_str == '\0')
+        return cols;
+
+    int paren_depth = 0, brace_depth = 0, brack_depth = 0;
+    char quote_char = '\0';
+    const char *token_start = cols_str;
+
+    for (const char *p = cols_str; ; p++) {
+        char c = *p;
+
+        if (quote_char != '\0') {
+            if (c == '\0')
+                break;
+            if (c == '\\' && *(p + 1) != '\0')
+                p++;
+            else if (c == quote_char)
+                quote_char = '\0';
+            continue;
+        }
+
+        if (c == '"' || c == '\'')
+            quote_char = c;
+        else if (c == '(')
+            paren_depth++;
+        else if (c == ')') {
+            if (paren_depth > 0) paren_depth--;
+        }
+        else if (c == '{')
+            brace_depth++;
+        else if (c == '}') {
+            if (brace_depth > 0) brace_depth--;
+        }
+        else if (c == '[')
+            brack_depth++;
+        else if (c == ']') {
+            if (brack_depth > 0) brack_depth--;
+        }
+        else if ((c == ',' && paren_depth == 0 && brace_depth == 0 && brack_depth == 0) || c == '\0') {
+            char *token = g_strndup(token_start, (size_t)(p - token_start));
+            g_strstrip(token);
+            g_ptr_array_add(cols, token);
+            if (c == '\0')
+                break;
+            token_start = p + 1;
+        }
+    }
+
+    if (quote_char != '\0' || paren_depth != 0 || brace_depth != 0 || brack_depth != 0) {
+        g_ptr_array_free(cols, TRUE);
+        return NULL;
+    }
+    return cols;
+}
+
 static bool
 iostat_init(const char *opt_arg, void *userdata _U_)
 {
@@ -1578,8 +1642,12 @@ iostat_init(const char *opt_arg, void *userdata _U_)
     uint32_t idx = 0;
     unsigned int i;
     io_stat_t *io;
-    const char *filters, *str, *pos;
+    const char *filters;
 
+    /* First, an overall check of the syntax.
+     * More precise syntax checks are performed later after the interval checks,
+     * for every single identified filter.
+     */
     io_decimal_point = localeconv()->decimal_point;
 
     /* XXX - Why can't the last character be a comma? Shouldn't it be
@@ -1609,6 +1677,8 @@ iostat_init(const char *opt_arg, void *userdata _U_)
         }
     }
     /* filters now either starts with ',' or '\0' */
+    if (*filters != '\0')
+        filters++;
 
     switch (timestamp_get_type()) {
     case TS_DELTA:
@@ -1665,9 +1735,11 @@ iostat_init(const char *opt_arg, void *userdata _U_)
         return false;
     }
 
-    /* Find how many ',' separated filters we have */
-    /* Filter can have internal commas, so this is only an upper bound on the
-     * number of filters. In the display filter grammar, commas only appear
+    /* Find how many ',' separated filters we have.
+     * In this context, a filter may be one expression with an operator such as MAX/MIN/..
+     *
+     * Filters can have internal commas.
+     * In the display filter grammar, commas only appear
      * inside delimiters (quoted strings, slices, sets, and functions), so
      * splitting in the wrong place produces an invalid filter. That is, there
      * can be at most only one valid interpretation (but might be none).
@@ -1675,23 +1747,18 @@ iostat_init(const char *opt_arg, void *userdata _U_)
      * XXX - If the grammar changes to allow commas in other places, then there
      * is ambiguity.
      *
-     * Perhaps ideally we'd verify the filters before doing allocation.
      */
+    GPtrArray *cols = split_iostat_columns(filters);
+
     io->num_cols = 1;
     nstime_set_unset(&io->start_time);
 
     if (*filters != '\0') {
-        /* Eliminate the first comma. */
-        filters++;
-        str = filters;
-        while ((str = strchr(str, ','))) {
-            io->num_cols++;
-            str++;
-        }
+        io->num_cols = cols->len;
     }
 
     io->items      = g_new0(io_stat_item_t, io->num_cols);
-    io->filters    = (const char **)g_malloc(sizeof(char *) * io->num_cols);
+    io->filters    = g_new0(const char *, io->num_cols);
     io->max_vals   = g_new(uint64_t, io->num_cols);
     io->max_frame  = g_new(uint32_t, io->num_cols);
     io->hf_indexes = g_new(int, io->num_cols);
@@ -1702,59 +1769,35 @@ iostat_init(const char *opt_arg, void *userdata _U_)
         io->max_frame[i] = 0;
     }
 
-    bool success;
+    bool success = true;
     GString *err = g_string_new(NULL);
 
-    /* Register a tap listener for each filter */
     if (filters[0] == '\0') {
         success = register_io_tap(io, 0, NULL, err);
-    } else {
-        char *filter;
-        i = 0;
-        str = filters;
-        pos = str;
-        while ((pos = strchr(pos, ',')) != NULL) {
-            if (pos == str) {
-                /* Consecutive commas - an empty filter. */
-                filter = NULL;
-            } else {
-                /* Likely a filter. */
-                filter = (char *)g_malloc((pos-str)+1);
-                (void) g_strlcpy( filter, str, (size_t) ((pos-str)+1));
-                filter = g_strstrip(filter);
-            }
+    }
+    else {
+        for (i = 0; i < cols->len && success; i++) {
+            const char *filter = (const char *) g_ptr_array_index(cols, i);
             success = register_io_tap(io, i, filter, err);
-            /* Advance to the next position to look for commas. */
-            pos++;
-            if (success) {
-                /* Also advance the filter start on success. */
-                str = pos;
-                i++;
-            } else {
-                g_free(filter);
-            }
         }
-        /* No more commas, the rest of the string is the last filter. */
-        filter = g_strstrip(g_strdup(str));
-        if (*filter) {
-            success = register_io_tap(io, i, filter, err);
-        } else {
-            success = register_io_tap(io, i, NULL, err);
-        }
-        if (success) {
-            i++;
-        }
-        io->num_cols = i;
     }
 
     if (!success) {
-        cmdarg_err("\ntshark: Couldn't register io,stat tap: %s\n",
-            err->str);
-        g_string_free(err, TRUE);
+        /* XXX - err->str is not always filled by register_io_tap() */
+        if (err->len > 0)
+            cmdarg_err("\ntshark: Couldn't register io,stat tap: %s\n", err->str);
+        else
+            cmdarg_err("\ntshark: Couldn't register io,stat tap.\n");
+    }
+
+    if (cols)
+        g_ptr_array_free(cols, TRUE);
+    g_string_free(err, TRUE);
+
+    if (!success) {
         iostat_io_free(io);
         return false;
     }
-    g_string_free(err, TRUE);
     return true;
 
 }
